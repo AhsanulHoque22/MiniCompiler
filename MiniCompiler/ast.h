@@ -55,6 +55,10 @@ ASTNode *newPrint(ASTNode *expr, int line);
 ASTNode *newBlock(ASTNode *stmts, int line);
 ASTNode *newStmtList(ASTNode *stmt, ASTNode *next, int line);
 
+/* In-place O(n) reversal of a NODE_STMT_LIST chain (see parser.y's
+   left-recursive stmt_list rule, which builds the list back-to-front). */
+ASTNode *reverseStmtList(ASTNode *list);
+
 const char *binOpToStr(BinOp op);
 
 #endif

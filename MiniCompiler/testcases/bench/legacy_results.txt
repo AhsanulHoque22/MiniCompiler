@@ -1,0 +1,16 @@
+Legacy (pre-fix) optimizer timing - Experiment B (gen_wide.py) only.
+Measured against a scratch build with copyPropagatePass()/deadCodeEliminatePass()
+replaced by legacy_optimizer_reference.c (flat-array O(m^2) implementation).
+Compare against testcases/bench/results.txt's "wide" rows for the current,
+hash-table-backed implementation on the same N.
+
+LEGACY wide N=2000  exit=0   time=1.643s   -- compiles
+LEGACY wide N=4000  exit=0   time=5.968s   -- compiles
+LEGACY wide N=8000  exit=0   time=28.729s  -- compiles
+LEGACY wide N=16000 exit=124 time=60.006s  -- did not finish (60s timeout)
+
+Current (hash-table) implementation, same N, for comparison (see results.txt):
+wide N=2000  exit=0 time=.029s
+wide N=4000  exit=0 time=.057s
+wide N=8000  exit=0 time=.118s
+wide N=16000 exit=0 time=.247s

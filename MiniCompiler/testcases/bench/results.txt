@@ -1,0 +1,22 @@
+=== Experiment A: gen_chain.py (depth-guard behavior, Sec. 5.5) ===
+chain N=500     exit=0 time=.007523497s  -- Target code written to output.asm
+chain N=1000    exit=0 time=.009047991s  -- Target code written to output.asm
+chain N=1500    exit=0 time=.011988474s  -- Target code written to output.asm
+chain N=2000    exit=0 time=.013421547s  -- Target code written to output.asm
+chain N=2500    exit=0 time=.023722042s  -- Target code written to output.asm
+chain N=3000    exit=0 time=.020488315s  -- Target code written to output.asm
+chain N=3001    exit=1 time=.004682141s  -- Compilation failed: 1 semantic error(s).
+chain N=4000    exit=1 time=.005111072s  -- Compilation failed: 1 semantic error(s).
+chain N=8000    exit=1 time=.006336900s  -- Compilation failed: 1 semantic error(s).
+chain N=32000   exit=1 time=.015505267s  -- Compilation failed: 1 semantic error(s).
+chain N=200000  exit=1 time=.067053932s  -- Compilation failed: 1 semantic error(s).
+
+=== Experiment B: gen_wide.py (optimizer O(m) scaling, Sec. 6.4/6.5) ===
+wide  N=2000    exit=0 time=.029480252s  -- Target code written to output.asm
+wide  N=4000    exit=0 time=.056558907s  -- Target code written to output.asm
+wide  N=8000    exit=0 time=.117919988s  -- Target code written to output.asm
+wide  N=16000   exit=0 time=.246986965s  -- Target code written to output.asm
+wide  N=32000   exit=0 time=.523472479s  -- Target code written to output.asm
+wide  N=50000   exit=0 time=.807579885s  -- Target code written to output.asm
+wide  N=100000  exit=0 time=1.650079006s  -- Target code written to output.asm
+wide  N=200000  exit=0 time=3.350232666s  -- Target code written to output.asm

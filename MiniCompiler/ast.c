@@ -108,6 +108,19 @@ ASTNode *newStmtList(ASTNode *stmt, ASTNode *next, int line)
     return n;
 }
 
+ASTNode *reverseStmtList(ASTNode *list)
+{
+    ASTNode *prev = NULL;
+    ASTNode *cur = list;
+    while (cur) {
+        ASTNode *next = cur->data.stmt_list.next;
+        cur->data.stmt_list.next = prev;
+        prev = cur;
+        cur = next;
+    }
+    return prev;
+}
+
 const char *binOpToStr(BinOp op)
 {
     switch (op) {

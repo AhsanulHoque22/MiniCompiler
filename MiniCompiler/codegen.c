@@ -4,6 +4,112 @@
 #include <ctype.h>
 #include "codegen.h"
 
+/* ---------------------------------------------------------------------- *
+ * A minimal chained-hash-table utility. Used by both the scope-correct
+ * name resolver below and the copy-propagation / dead-code-elimination
+ * optimizer passes further down, to keep every one of them at O(1)
+ * average lookup/insert - a flat array or linked list scanned linearly
+ * per lookup would instead give O(k) per lookup and O(k^2) for a pass or
+ * scope with k entries. Entries are bump-allocated from a preallocated
+ * pool sized for the caller's use case, so there is no per-insert malloc.
+ * ---------------------------------------------------------------------- */
+
+typedef struct StrEntry {
+    const char *key;
+    const char *value; /* unused by the int-map instantiation below */
+    int ivalue;
+    struct StrEntry *next;
+} StrEntry;
+
+typedef struct {
+    StrEntry **buckets;
+    int nbuckets;
+    StrEntry *pool;
+    int poolUsed;
+} StrMap;
+
+static unsigned long djb2hash(const char *s)
+{
+    unsigned long h = 5381;
+    int c;
+    while ((c = (unsigned char)*s++))
+        h = ((h << 5) + h) + c;
+    return h;
+}
+
+static StrMap *smCreate(int sizeHint)
+{
+    StrMap *m = (StrMap *)malloc(sizeof(StrMap));
+    if (!m) {
+        fprintf(stderr, "Fatal: out of memory allocating hash table\n");
+        exit(1);
+    }
+    m->nbuckets = sizeHint < 8 ? 8 : sizeHint;
+    m->buckets = (StrEntry **)calloc((size_t)m->nbuckets, sizeof(StrEntry *));
+    m->pool = (StrEntry *)malloc((size_t)(sizeHint + 1) * sizeof(StrEntry));
+    m->poolUsed = 0;
+    if (!m->buckets || !m->pool) {
+        fprintf(stderr, "Fatal: out of memory allocating hash table\n");
+        exit(1);
+    }
+    return m;
+}
+
+static void smClear(StrMap *m)
+{
+    memset(m->buckets, 0, (size_t)m->nbuckets * sizeof(StrEntry *));
+    m->poolUsed = 0;
+}
+
+static void smDestroy(StrMap *m)
+{
+    free(m->buckets);
+    free(m->pool);
+    free(m);
+}
+
+static StrEntry *smFind(StrMap *m, const char *key)
+{
+    unsigned long idx = djb2hash(key) % (unsigned long)m->nbuckets;
+    for (StrEntry *e = m->buckets[idx]; e; e = e->next)
+        if (strcmp(e->key, key) == 0) return e;
+    return NULL;
+}
+
+static void smSetStr(StrMap *m, const char *key, const char *value)
+{
+    StrEntry *e = smFind(m, key);
+    if (e) { e->value = value; return; }
+    unsigned long idx = djb2hash(key) % (unsigned long)m->nbuckets;
+    e = &m->pool[m->poolUsed++];
+    e->key = key; e->value = value; e->ivalue = 0;
+    e->next = m->buckets[idx];
+    m->buckets[idx] = e;
+}
+
+static void smSetInt(StrMap *m, const char *key, int value)
+{
+    StrEntry *e = smFind(m, key);
+    if (e) { e->ivalue = value; return; }
+    unsigned long idx = djb2hash(key) % (unsigned long)m->nbuckets;
+    e = &m->pool[m->poolUsed++];
+    e->key = key; e->value = NULL; e->ivalue = value;
+    e->next = m->buckets[idx];
+    m->buckets[idx] = e;
+}
+
+static const char *smGetStr(StrMap *m, const char *key)
+{
+    StrEntry *e = smFind(m, key);
+    return e ? e->value : NULL;
+}
+
+static int smGetInt(StrMap *m, const char *key, int missingValue)
+{
+    StrEntry *e = smFind(m, key);
+    return e ? e->ivalue : missingValue;
+}
+
 /* ---------------------------------------------------------------------- */
 /* TAC list management                                                    */
 /* ---------------------------------------------------------------------- */
@@ -59,50 +165,38 @@ static char *newLabel(void)
 /* Scope-correct naming for shadowed declarations (x, x$2, x$3, ...)      */
 /* This mirrors symbol_table.c's scope-stack shadowing resolution order,  */
 /* but is independent of it: semantic.c's symbol table is already freed  */
-/* by the time code generation runs.                                     */
+/* by the time code generation runs. Each scope's bindings and the global */
+/* per-name declaration counter are StrMaps (O(1) average lookup/insert), */
+/* not linked lists - for a wide program with many distinct top-level     */
+/* names, a linked-list scan here would be exactly the same O(k^2)        */
+/* mistake already fixed in the optimizer passes below (see §6.4/§6.5     */
+/* of the report and the empirical benchmark that caught it in §6.6).     */
 /* ---------------------------------------------------------------------- */
 
-typedef struct NameBinding {
-    char *sourceName;
-    char *tacName;
-    struct NameBinding *next;
-} NameBinding;
-
 typedef struct CGScope {
-    NameBinding *bindings;
+    StrMap *bindings;
     struct CGScope *parent;
 } CGScope;
 
 static CGScope *cgCurrent = NULL;
+static StrMap *declCounts = NULL;
 
-typedef struct DeclCount {
-    char *name;
-    int count;
-    struct DeclCount *next;
-} DeclCount;
-
-static DeclCount *declCounts = NULL;
+/* Sizing hint for every StrMap created during codegen: an exact upper
+   bound (V, the total number of declarations in the program - see report
+   §7.2) computed once via a single O(n) AST walk before codegen starts. */
+static int cgSizeHint = 16;
 
 static int nextDeclIndex(const char *name)
 {
-    for (DeclCount *d = declCounts; d; d = d->next) {
-        if (strcmp(d->name, name) == 0) {
-            d->count++;
-            return d->count;
-        }
-    }
-    DeclCount *d = (DeclCount *)malloc(sizeof(DeclCount));
-    d->name = strdup(name);
-    d->count = 1;
-    d->next = declCounts;
-    declCounts = d;
-    return 1;
+    int c = smGetInt(declCounts, name, 0) + 1;
+    smSetInt(declCounts, name, c);
+    return c;
 }
 
 static void cgEnterScope(void)
 {
     CGScope *s = (CGScope *)malloc(sizeof(CGScope));
-    s->bindings = NULL;
+    s->bindings = smCreate(cgSizeHint);
     s->parent = cgCurrent;
     cgCurrent = s;
 }
@@ -112,12 +206,7 @@ static void cgExitScope(void)
     if (!cgCurrent) return;
     CGScope *dead = cgCurrent;
     cgCurrent = cgCurrent->parent;
-    NameBinding *b = dead->bindings;
-    while (b) {
-        NameBinding *next = b->next;
-        free(b);
-        b = next;
-    }
+    smDestroy(dead->bindings);
     free(dead);
 }
 
@@ -134,11 +223,9 @@ static char *cgDeclare(const char *sourceName)
         tacName = strdup(buf);
     }
 
-    NameBinding *b = (NameBinding *)malloc(sizeof(NameBinding));
-    b->sourceName = strdup(sourceName);
-    b->tacName = strdup(tacName);
-    b->next = cgCurrent->bindings;
-    cgCurrent->bindings = b;
+    /* Store an independent copy as the map's value: the caller frees the
+       tacName this function returns once it has emitted its own TAC. */
+    smSetStr(cgCurrent->bindings, sourceName, strdup(tacName));
 
     return tacName;
 }
@@ -147,13 +234,47 @@ static char *cgDeclare(const char *sourceName)
 static char *cgResolve(const char *sourceName)
 {
     for (CGScope *sc = cgCurrent; sc; sc = sc->parent) {
-        for (NameBinding *b = sc->bindings; b; b = b->next) {
-            if (strcmp(b->sourceName, sourceName) == 0)
-                return strdup(b->tacName);
-        }
+        const char *found = smGetStr(sc->bindings, sourceName);
+        if (found) return strdup(found);
     }
     /* Should be unreachable: semantic analysis already rejected undeclared uses. */
     return strdup(sourceName);
+}
+
+/* One O(n) walk to size every StrMap created during codegen (see cgSizeHint
+   above): counts every NODE_VAR_DECL reachable from a statement list,
+   recursing into if/while bodies and nested blocks. */
+static int countVarDeclsInStmt(ASTNode *stmt)
+{
+    if (!stmt) return 0;
+    switch (stmt->type) {
+        case NODE_VAR_DECL:
+            return 1;
+        case NODE_IF: {
+            int c = countVarDeclsInStmt(stmt->data.if_stmt.then_stmt);
+            if (stmt->data.if_stmt.else_stmt)
+                c += countVarDeclsInStmt(stmt->data.if_stmt.else_stmt);
+            return c;
+        }
+        case NODE_WHILE:
+            return countVarDeclsInStmt(stmt->data.while_stmt.body);
+        case NODE_BLOCK: {
+            int c = 0;
+            for (ASTNode *cur = stmt->data.block.stmts; cur; cur = cur->data.stmt_list.next)
+                c += countVarDeclsInStmt(cur->data.stmt_list.stmt);
+            return c;
+        }
+        default:
+            return 0;
+    }
+}
+
+static int countVarDecls(ASTNode *list)
+{
+    int count = 0;
+    for (ASTNode *cur = list; cur; cur = cur->data.stmt_list.next)
+        count += countVarDeclsInStmt(cur->data.stmt_list.stmt);
+    return count;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -312,12 +433,18 @@ TACList *generateTAC(ASTNode *program)
     tac = (TACList *)calloc(1, sizeof(TACList));
     tempCounter = 0;
     labelCounter = 0;
-    declCounts = NULL;
     cgCurrent = NULL;
+
+    cgSizeHint = countVarDecls(program);
+    if (cgSizeHint < 16) cgSizeHint = 16;
+    declCounts = smCreate(cgSizeHint);
 
     cgEnterScope();
     genStmtList(program);
     cgExitScope();
+
+    smDestroy(declCounts);
+    declCounts = NULL;
 
     return tac;
 }
@@ -425,112 +552,6 @@ static int algebraicSimplifyPass(TACList *list)
         }
     }
     return changed;
-}
-
-/* ---------------------------------------------------------------------- *
- * A minimal chained-hash-table utility, used to keep the copy-propagation
- * and dead-code-elimination passes at O(m) amortized (matching the report's
- * documented linear-pass complexity) instead of the O(m^2) that a flat
- * array scanned per-lookup would give on inputs with many temporaries
- * (e.g. a long chain of chained binary operators). Entries are bump-
- * allocated from a preallocated pool sized for the pass, so there is no
- * per-insert malloc.
- * ---------------------------------------------------------------------- */
-
-typedef struct StrEntry {
-    const char *key;
-    const char *value; /* unused by the int-map instantiation below */
-    int ivalue;
-    struct StrEntry *next;
-} StrEntry;
-
-typedef struct {
-    StrEntry **buckets;
-    int nbuckets;
-    StrEntry *pool;
-    int poolUsed;
-} StrMap;
-
-static unsigned long djb2hash(const char *s)
-{
-    unsigned long h = 5381;
-    int c;
-    while ((c = (unsigned char)*s++))
-        h = ((h << 5) + h) + c;
-    return h;
-}
-
-static StrMap *smCreate(int sizeHint)
-{
-    StrMap *m = (StrMap *)malloc(sizeof(StrMap));
-    if (!m) {
-        fprintf(stderr, "Fatal: out of memory allocating optimizer hash table\n");
-        exit(1);
-    }
-    m->nbuckets = sizeHint < 8 ? 8 : sizeHint;
-    m->buckets = (StrEntry **)calloc((size_t)m->nbuckets, sizeof(StrEntry *));
-    m->pool = (StrEntry *)malloc((size_t)(sizeHint + 1) * sizeof(StrEntry));
-    m->poolUsed = 0;
-    if (!m->buckets || !m->pool) {
-        fprintf(stderr, "Fatal: out of memory allocating optimizer hash table\n");
-        exit(1);
-    }
-    return m;
-}
-
-static void smClear(StrMap *m)
-{
-    memset(m->buckets, 0, (size_t)m->nbuckets * sizeof(StrEntry *));
-    m->poolUsed = 0;
-}
-
-static void smDestroy(StrMap *m)
-{
-    free(m->buckets);
-    free(m->pool);
-    free(m);
-}
-
-static StrEntry *smFind(StrMap *m, const char *key)
-{
-    unsigned long idx = djb2hash(key) % (unsigned long)m->nbuckets;
-    for (StrEntry *e = m->buckets[idx]; e; e = e->next)
-        if (strcmp(e->key, key) == 0) return e;
-    return NULL;
-}
-
-static void smSetStr(StrMap *m, const char *key, const char *value)
-{
-    StrEntry *e = smFind(m, key);
-    if (e) { e->value = value; return; }
-    unsigned long idx = djb2hash(key) % (unsigned long)m->nbuckets;
-    e = &m->pool[m->poolUsed++];
-    e->key = key; e->value = value; e->ivalue = 0;
-    e->next = m->buckets[idx];
-    m->buckets[idx] = e;
-}
-
-static void smSetInt(StrMap *m, const char *key, int value)
-{
-    StrEntry *e = smFind(m, key);
-    if (e) { e->ivalue = value; return; }
-    unsigned long idx = djb2hash(key) % (unsigned long)m->nbuckets;
-    e = &m->pool[m->poolUsed++];
-    e->key = key; e->value = NULL; e->ivalue = value;
-    e->next = m->buckets[idx];
-    m->buckets[idx] = e;
-}
-
-static const char *smGetStr(StrMap *m, const char *key)
-{
-    StrEntry *e = smFind(m, key);
-    return e ? e->value : NULL;
-}
-
-static int smGetInt(StrMap *m, const char *key, int missingValue)
-{
-    StrEntry *e = smFind(m, key);
-    return e ? e->ivalue : missingValue;
 }
 
 /* ---------------------------------------------------------------------- *

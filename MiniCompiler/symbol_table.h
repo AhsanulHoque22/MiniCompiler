@@ -12,7 +12,9 @@ typedef struct Symbol {
 } Symbol;
 
 typedef struct Scope {
-    Symbol *buckets[NUM_BUCKETS];
+    Symbol **buckets;    /* dynamically sized, grown (and rehashed) on demand */
+    int nbuckets;
+    int count;           /* symbols currently in this scope, for load-factor tracking */
     struct Scope *parent;
 } Scope;
 

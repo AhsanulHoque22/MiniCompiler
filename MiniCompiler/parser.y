@@ -43,12 +43,19 @@ void yyerror(const char *s);
 %%
 
 program:
-      stmt_list { programRoot = $1; }
+      stmt_list { programRoot = reverseStmtList($1); }
     ;
 
+/* Left-recursive by design: a right-recursive stmt_list (stmt stmt_list)
+   would force Bison to hold every statement on its parse stack until the
+   final reduce, giving O(n) parser-stack depth for a plain sequence of n
+   statements - not just for genuinely nested constructs. Left recursion
+   lets Bison reduce as it goes (O(1) stack per statement), at the cost of
+   building the list in reverse; reverseStmtList() restores source order
+   in one O(n) pass wherever a stmt_list is finalized (here and in block). */
 stmt_list:
       /* empty */      { $$ = NULL; }
-    | stmt stmt_list   { $$ = newStmtList($1, $2, yylineno); }
+    | stmt_list stmt    { $$ = newStmtList($2, $1, yylineno); }
     ;
 
 stmt:
@@ -88,7 +95,7 @@ print_stmt:
     ;
 
 block:
-      LBRACE stmt_list RBRACE { $$ = newBlock($2, yylineno); }
+      LBRACE stmt_list RBRACE { $$ = newBlock(reverseStmtList($2), yylineno); }
     ;
 
 expr:
